@@ -91,14 +91,7 @@ Use `--graph_prefill 1` to capture prefill in a CUDA graph as well, and `--real 
 
 ## Citation
 
-```bibtex
-@article{li2026groupmask,
-  title  = {GroupMask: Layer-Adaptive Group-wise Sparsity for Semi-Structured LLM Pruning},
-  author = {Li, Zhengao and Li, Shuoqiu and Zhang, Xiaofang and Jin, Yukai and Kestor, Gokcen and
-            Zhang, Yanfu and Zeng, Yiming and Ren, Bin and Zhang, Chuxu and Gao, Shangqian},
-  year   = {2026}
-}
-```
+The citation will be added after the review period.
 
 ## License
 
