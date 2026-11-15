@@ -1,0 +1,1 @@
+from .check import is_tie_word_embeddings

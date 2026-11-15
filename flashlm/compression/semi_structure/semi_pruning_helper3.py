@@ -11,11 +11,11 @@ from torch.cuda.amp import GradScaler
 import torch.nn as nn
 
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
-from .hypernetwork import virtual_operation
+from .hypernetwork2 import virtual_operation
 from torch.nn import Module
 
 def clear_cache_hook(module: Module, *args):
-    from .hypernetwork import virtual_operation
+    from .hypernetwork2 import virtual_operation
     # Do not clear cache in eval mode; only clear during training to avoid recomputation on every forward
     if not module.training:
         return
@@ -24,7 +24,7 @@ def clear_cache_hook(module: Module, *args):
 
 def register_virtual_cache_hooks(model: Module):
     for m in model.modules():
-        from .hypernetwork import virtual_operation
+        from .hypernetwork2 import virtual_operation
         if isinstance(m, virtual_operation):
             m.register_forward_pre_hook(clear_cache_hook)
 
@@ -41,7 +41,7 @@ def log_inv_function(sum_params, sum_ori_params, p):
     return loss
 
 class collect_info_reg(nn.Module):
-    def __init__(self, model, p=None, lam=4.0):
+    def __init__(self, model, p=None, lam=4.0, uniform=False):
         super(collect_info_reg, self).__init__()
         self.sum_ori_params = 0
         self.p = p
@@ -51,6 +51,7 @@ class collect_info_reg(nn.Module):
         self.out_group_list = []
         self.structures = []
         self.lam = lam
+        self.uniform = uniform
         self.expand_rate = 1
         self.mlp_only = False
         #self.rescale_factor = 1
@@ -70,6 +71,22 @@ class collect_info_reg(nn.Module):
                 self.out_group_list.append(m.ex_dict['groups_out'])
                 self.structures.append(m.dim)
         print("number of oringal parameters: %.3f" % (self.sum_ori_params / 10 ** 6))
+        # optional per-block keep targets (OWL-style) for the uniform ablation
+        self.p_list = None
+        # learned per-block allocation (TIE_BLOCK_SIZE = structures per block, 0 = off)
+        self.tie_block = int(__import__('os').environ.get('TIE_BLOCK_SIZE', '0'))
+        if self.tie_block:
+            assert len(self.structures) % self.tie_block == 0, (len(self.structures), self.tie_block)
+            print('[tie-within-block] %d blocks x %d structures' % (len(self.structures) // self.tie_block, self.tie_block))
+        import os as _os, json as _json
+        _pb = _os.environ.get("PER_BLOCK_KEEP_JSON")
+        if _pb and self.uniform:
+            _keep = _json.load(open(_pb))["keep"]
+            _n = len(self.structures)
+            assert _n % len(_keep) == 0, (_n, len(_keep))
+            _per = _n // len(_keep)
+            self.p_list = [float(_keep[k // _per]) for k in range(_n)]
+            print("[per-block keep] %d blocks x %d structures, mean keep %.4f" % (len(_keep), _per, sum(self.p_list) / _n))
 
     def count_current_params(self, vectors):
         with torch.no_grad():
@@ -83,6 +100,27 @@ class collect_info_reg(nn.Module):
         return sum_params
 
     def forward(self, vectors):
+        if self.uniform:
+            # [ABLATION] Push every structure's OWN keep-ratio toward p
+            # individually, instead of only constraining the global
+            # aggregate ratio. This yields a per-layer-uniform sparsity
+            # target rather than letting the hypernetwork freely
+            # reallocate sparsity across layers as long as the average
+            # matches p.
+            total_loss = 0.0
+            for i in range(len(self.structures)):
+                model_dim = vectors[i].sum()
+                keep_ratio = model_dim / (self.in_group_list[i] * self.out_group_list[i])
+                p_i = self.p if self.p_list is None else self.p_list[i]
+                if keep_ratio > p_i:
+                    clamped = torch.clamp(keep_ratio, min=p_i)
+                    loss_i = torch.log(clamped / p_i)
+                else:
+                    clamped = torch.clamp(keep_ratio, max=p_i)
+                    loss_i = torch.log(p_i / clamped)
+                total_loss = total_loss + loss_i
+            return self.lam * total_loss / len(self.structures)
+
         sum_params = 0
         for i in range(len(self.structures)):
             model_dim = vectors[i].sum()
@@ -97,9 +135,21 @@ class collect_info_reg(nn.Module):
             clampled_p_ratio = torch.clamp(param_ratio, max=self.p)
 
             loss = torch.log(self.p/clampled_p_ratio)
-        
+
         # print("current parameters: %.3f" % (sum_params / 10 ** 6))
         # loss = custom_grad_weight.apply(loss, self.grad_w)
+
+        if self.tie_block:
+            k = self.tie_block
+            keeps = [vectors[i].sum() / (self.in_group_list[i] * self.out_group_list[i]) for i in range(len(self.structures))]
+            sizes = [float(self.in_dim_list[i] * self.out_dim_list[i]) for i in range(len(self.structures))]
+            tie = 0.0
+            for b in range(len(self.structures) // k):
+                idx = range(b * k, (b + 1) * k)
+                kb = sum(keeps[i] * sizes[i] for i in idx) / sum(sizes[i] for i in idx)
+                for i in idx:
+                    tie = tie + torch.abs(torch.log(torch.clamp(keeps[i], min=1e-6) / torch.clamp(kb, min=1e-6)))
+            loss = loss + tie / len(self.structures)
 
         return self.lam * loss
 

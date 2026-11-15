@@ -156,6 +156,50 @@ def apply_hn_gates_new(model, hn, hn_helper, device="cuda:0", param_reg=None, is
             for i in range(len(soft_vectors))
         ]
 
+    # soft-vs-hard gate analysis.
+    # GATE_HIST_JSON=<file>: dump the distribution of the noise-free soft gate values.
+    # EXPORT_GATE_SOFT=1: export W * soft gate (no rounding) instead of the hard mask.
+    # GATE_DUMP_LOGITS=<file.pt>: save the effective gate logits u (gate = sigmoid((u + G)/T)) for every group,
+    # u = p + base for simplifed_gate, u = head output + base for hypernetwork; GATE_DUMP_ONLY=1 exits afterwards.
+    if os.environ.get("GATE_DUMP_LOGITS"):
+        with torch.no_grad(), torch.autocast("cuda", enabled=False):
+            if is_simple:
+                u = torch.cat([(q.detach().float() + hn.base).flatten() for q in hn.p_list]).cpu()
+            else:
+                os.environ["SEMI_RETURN_LOGITS"] = "1"
+                hn.train()
+                u = torch.cat([v.detach().float().flatten() for v in hn(torch.zeros(1, device=next(hn.parameters()).device))]).cpu()
+                hn.eval()
+                os.environ["SEMI_RETURN_LOGITS"] = "0"
+        torch.save({"u": u, "T": float(hn.T), "base": float(hn.base)}, os.environ["GATE_DUMP_LOGITS"])
+        print("[GATE-DUMP]", os.environ["GATE_DUMP_LOGITS"], u.numel(), "T", hn.T, "base", hn.base, flush=True)
+        if os.environ.get("GATE_DUMP_ONLY") == "1":
+            import sys as _sys
+            _sys.exit(0)
+    if os.environ.get("GATE_HIST_JSON") or os.environ.get("EXPORT_GATE_SOFT") == "1":
+        with torch.autocast("cuda", enabled=False):
+            if is_simple:  # simplifed_gate (hypernetwork2) in det-eval mode already returns sigmoid((p+base)/T)
+                det_soft = [v.float() for v in hn()]
+            else:          # hypernetwork: train-mode forward without Gumbel noise = sigmoid((logit+base)/T)
+                os.environ["SEMI_TRAIN_DETERMINISTIC"] = "1"
+                hn.train()
+                det_soft = [v.float() for v in hn(torch.zeros(1, device=next(hn.parameters()).device))]
+                hn.eval()
+        allv = torch.cat([v.flatten() for v in det_soft])
+        if os.environ.get("GATE_HIST_JSON"):
+            import json as _json
+            edges = [0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0000001]
+            cnt = [((allv >= a) & (allv < b)).sum().item() for a, b in zip(edges[:-1], edges[1:])]
+            info = {"n": allv.numel(), "edges": edges, "counts": cnt,
+                    "frac_lt_0.01": (allv < 0.01).float().mean().item(), "frac_gt_0.99": (allv > 0.99).float().mean().item(),
+                    "frac_0.1_0.9": ((allv > 0.1) & (allv < 0.9)).float().mean().item(),
+                    "mean": allv.mean().item(), "hard_keep": (allv > 0.5).float().mean().item()}
+            _json.dump(info, open(os.environ["GATE_HIST_JSON"], "w"), indent=1)
+            print("[GATE-HIST]", _json.dumps({k: v for k, v in info.items() if k != "counts"}), flush=True)
+        if os.environ.get("EXPORT_GATE_SOFT") == "1":
+            gate_vectors = det_soft
+            print("[EXPORT] using SOFT gates (no rounding); mean gate", allv.mean().item(), flush=True)
+
     summarize_param(hard_vectors, param_reg, tag="[EVAL-HARD]", hard=True)
     summarize_param(gate_vectors, param_reg, tag="[EVAL-HARDxSOFT]", hard=False)
 
@@ -209,7 +253,7 @@ def save_hf_model(model: nn.Module, tokenizer, save_dir: str) -> None:
     tokenizer.save_pretrained(save_dir)
     print(f"[INFO] Saved HF model to: {save_dir}")
 
-# ==== 1) 烘焙：把 mask/gate 乘进权重 ====
+# ==== 1) Bake: multiply the masks/gates into the weights ====
 @torch.no_grad()
 def _maybe_to(t, ref):
     if t is None: 
@@ -334,7 +378,7 @@ def export_hf_readable(model: nn.Module, tokenizer, save_dir: str, device: str =
     model.save_pretrained(save_dir)
     if tokenizer is not None:
         tokenizer.save_pretrained(save_dir)
-    print(f"[export] saved Hugging Face-readable model to: {save_dir}")
+    print(f"[export] saved HF-readable model to: {save_dir}")
 
 @torch.no_grad()
 def bake_masks_inplace(model: nn.Module, verbose: bool = True, debug: bool = True):
@@ -505,8 +549,8 @@ def evaluate(
 
 
 def main(
-    hf_model: str = "Qwen/Qwen3-14B",
-    hn_path: str = "./checkpoints/hn-ckpt-final.pt",
+    hf_model: str = "meta-llama/Llama-2-7b-hf",
+    hn_path: str = "outputs/hn-ckpt-final.pt",
     #semi_config: str = None,
     compressed_model: Optional[str] = None,
     dynamic_evaluate: bool = False,
@@ -595,6 +639,8 @@ def main(
                                                          )
         # from flashlm.compression.
         from flashlm.compression.semi_structure.hypernetwork import hypernetwork, simplifed_gate
+        if os.environ.get("EXPORT_GATE_V2") == "1":  # export with the same gate class used in training
+            from flashlm.compression.semi_structure.hypernetwork2 import simplifed_gate
         from flashlm.compression.semi_structure.semi_pruning_helper import collect_info_reg, help_functions_hn, model_replace
         group_info = {}
         group_info['groups_in_dim'] = groups_in_dim
@@ -649,7 +695,7 @@ def main(
         bake_masks_inplace(model, verbose=True)
         unwrap_wrapped_linears(model, verbose=True)
         print(model.model.layers[0].mlp.down_proj) 
-        assert not any(".linear" in n for n, _ in model.named_modules()), "仍含 .linear 子模块"
+        assert not any(".linear" in n for n, _ in model.named_modules()), "wrapped .linear submodules remain"
         defactorize_and_unwrap(model, verbose=True)
         export_hf_readable(model, tokenizer, save_hf_dir, device='cuda')
         # print(model.model.layers[0].mlp.down_proj)          
@@ -657,7 +703,7 @@ def main(
 
         print("\n[CHECK] Running post-bake forward...")
 
-        # 关键：关闭 mask 机制避免重复乘
+        # Important: disable the mask mechanism to avoid applying it twice
         hn_helper.set_mask_status(model, use_mask=False)
         for m in model.modules():
             if hasattr(m, "_cached_mask"):

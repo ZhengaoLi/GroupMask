@@ -1,0 +1,46 @@
+{
+ "64": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+   "1": [
+    2,
+    16,
+    1,
+    false
+   ],
+   "8": [
+    1,
+    4,
+    1,
+    true
+   ],
+   "16": [
+    1,
+    8,
+    2,
+    true
+   ]
+  }
+ },
+ "256": {
+  "NVIDIA RTX PRO 6000 Blackwell Server Edition": {
+   "1": [
+    1,
+    4,
+    2,
+    false
+   ],
+   "8": [
+    1,
+    2,
+    4,
+    true
+   ],
+   "16": [
+    1,
+    2,
+    1,
+    true
+   ]
+  }
+ }
+}

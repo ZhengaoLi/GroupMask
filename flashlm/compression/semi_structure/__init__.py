@@ -1,5 +1,12 @@
-"""Backward-compatible imports for the semi-structure compression package."""
+from .semi_pruning_helper import (
+    collect_info_reg,
+    help_functions_hn,
+    model_replace,
+    hidden_state_kd_loss,
+)
 
-from ..hypernetwork import *  # noqa: F401,F403
-from ..semi_pruning_helper import *  # noqa: F401,F403
-
+from .hypernetwork import (
+    hypernetwork,
+    simplifed_gate,
+    virtual_operation
+)

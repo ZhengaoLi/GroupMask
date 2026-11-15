@@ -207,8 +207,12 @@ class virtual_operation(nn.Module):
         else:
             self.generate_pv_repeat(seed=seed, p=p)
                 #self.mask = self.forward().to(torch.uint8)
-        device = self.pruning_vector.device
-        self._cached_mask = self.forward(device=device).to(torch.uint8)
+        # [MEM] Do not eagerly materialize a permanent full-weight-sized GPU
+        # mask here. self.mask (used by SemiSparseLinear at actual forward
+        # time) is already set above; caching another full copy in
+        # self._cached_mask pins ~1 extra byte/param on every GPU rank for
+        # the life of the process, before FSDP ever gets a chance to shard
+        # anything. forward() below recomputes on demand instead.
     
     def forward_bias(self, device=None):
         if device is not None and self.bias is not None:
@@ -233,8 +237,6 @@ class virtual_operation(nn.Module):
         # print(f"\n[DEBUG - virtual_operation FORWARD CALL] Called {self.__class__.__name__}")
         # traceback.print_stack(limit=10)
 
-        if self._cached_mask is not None:
-            return self._cached_mask.to(device)
         # if not self._debug_printed:
         #     print(f"[DEBUG] Memory allocated: {torch.cuda.memory_allocated()/1024/1024:.2f} MiB")
         #     print(f"[DEBUG] Memory reserved:  {torch.cuda.memory_reserved()/1024/1024:.2f} MiB")
@@ -275,8 +277,7 @@ class virtual_operation(nn.Module):
             # p_v = torch.cat(tuple(p_v), dim=1)
             # mask = torch.cat(torch.chunk(p_v, self.ex_dict['groups_out'], dim=1), dim=0)
             mask = p_v
-        
-        self._cached_mask = mask
+
         return mask
 
     def get_parameters(self):
@@ -298,10 +299,13 @@ class simplifed_gate(nn.Module):
     def __init__(self, t_structures, num_groups=1, reinmax=False):
         super(simplifed_gate, self).__init__()
         self.T = 0.4
-        self.base = 3.0
+        self.base = float(os.environ.get('SIMPLE_GATE_BASE', '3.0'))
+        self.det_eval = os.environ.get('SIMPLE_GATE_DET_EVAL', '0') == '1'
         self.t_sp = t_structures
 
-        self.p_list = nn.ParameterList([nn.Parameter(torch.randn(t_structures[i])) for i in range(len(t_structures))])
+        # optional init shift for the w/o-HN ablation (SIMPLE_GATE_INIT_SHIFT, default 0 = original)
+        _shift = float(os.environ.get('SIMPLE_GATE_INIT_SHIFT', '0'))
+        self.p_list = nn.ParameterList([nn.Parameter(torch.randn(t_structures[i]) + _shift) for i in range(len(t_structures))])
         self.groups = num_groups
         
         if reinmax:
@@ -311,7 +315,30 @@ class simplifed_gate(nn.Module):
         else:
             self.approxiate_fucntion = gumbel_sigmoid_sample
             self.reinmax = False
+    def _det_scores(self):
+        # SIMPLE_GATE_TOPK=<keep ratio> -> deterministic hard mask that keeps the top-k learned logits
+        # globally (all groups have the same size, so count == params); kept gates are exactly 1 (no soft scaling).
+        k = os.environ.get("SIMPLE_GATE_TOPK")
+        if k:
+            allp = torch.cat([q.detach().flatten().float() for q in self.p_list])
+            n_keep = int(round(float(k) * allp.numel()))
+            thr = torch.topk(allp, n_keep).values.min()
+            return [(self.p_list[i].detach().float() >= thr).float().squeeze() for i in range(len(self.t_sp))]
+        return [torch.sigmoid((self.p_list[i] + self.base) / self.T).squeeze() for i in range(len(self.t_sp))]
+
     def forward(self,):
+        if (not self.training) and self.det_eval:
+            return self._det_scores()
+        # SIMPLE_GATE_FOLLOW_SEMI=1 makes the w/o-HN gate follow the SAME training protocol as the
+        # hypernetwork (the recipe sets SEMI_TRAIN_DETERMINISTIC=1 / SEMI_FORCE_HARD=1 before every gate call):
+        # deterministic sigmoid((p+base)/T), then hard 0/1 with a straight-through estimator. Default: unchanged.
+        if self.training and os.environ.get("SIMPLE_GATE_FOLLOW_SEMI", "0") == "1":
+            scores = [torch.sigmoid((self.p_list[i] + self.base) / self.T).squeeze() for i in range(len(self.t_sp))]
+            if os.environ.get("SEMI_TRAIN_DETERMINISTIC", "0") != "1":
+                scores = [self.approxiate_fucntion(self.p_list[i], offset=self.base, T=self.T).squeeze() for i in range(len(self.t_sp))]
+            if os.environ.get("SEMI_FORCE_HARD", "0") != "0":
+                scores = [hard_sample(s_) for s_ in scores]
+            return scores
         if self.reinmax:
             tp_out = [self.approxiate_fucntion(self.p_list[i], offset=self.base, T=self.T, hard_sample=True)[0].squeeze() for i in
                     range(len(self.t_sp))]
@@ -325,6 +352,8 @@ class simplifed_gate(nn.Module):
         return tp_out
     
     def hard_output(self):
+        if (not self.training) and self.det_eval:
+            return [hard_sample(s_) for s_ in self._det_scores()]
         if self.reinmax:
             tp_out = [self.approxiate_fucntion(self.p_list[i], offset=self.base, T=self.T, hard_sample=True)[0].squeeze() for i in
                     range(len(self.t_sp))]
@@ -458,12 +487,12 @@ class hypernetwork(nn.Module):
                     tp_out = [self.approxiate_fucntion(tp_out[i], offset=self.base, T=self.T, hard_sample=True)[0].squeeze() for i in
                     range(len(self.linear_list_tp))]
             else:
-                # # comment 掉这段
+                # # (disabled)
                 # tp_out = [self.approxiate_fucntion(tp_out[i], offset=self.base, T=self.T).squeeze() for i in
                 #     range(len(self.linear_list_tp))]
                 # if self.hard_flag:
                 #     tp_out = [hard_sample(tp_out[i]) for i in range(len(self.linear_list_tp))]
-                ## 新增这段 便于获得hard的deterministic
+                ## deterministic hard gate
                 det_train = os.environ.get("SEMI_TRAIN_DETERMINISTIC", "0") != "0"
                 force_hard = os.environ.get("SEMI_FORCE_HARD", "0") != "0"
 

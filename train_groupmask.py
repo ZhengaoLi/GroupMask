@@ -16,7 +16,7 @@ from torch.cuda.amp import GradScaler
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer as HFLlamaDecoderLayer
 from datasets import IterableDataset
-from flashlm.models import FlashLlamaForCausalLM, FlashLlamaTokenizer
+from flashlm.models import FlashLlamaForCausalLM, FlashLlamaDecoderLayer, FlashLlamaTokenizer
 from flashlm.utils import DistributedEnv, softmax_fp32, log_softmax_fp32
 from flashlm.data import distributed_mixed_datasets, dataloader_creator, load_hf_dataset_pile_dedup, load_hf_dataset_minipile, load_hf_dataset_wiki, load_hf_dataset_alpaca, load_hf_dataset_wizardlMv2, load_hf_dataset_mixed, load_hf_dataset_new_mixed, load_hf_dataset_orca_dpo
 from flashlm.compression.weightsharing import is_tie_word_embeddings
@@ -41,33 +41,12 @@ from torch.distributed.fsdp.wrap import (
     wrap,
 )
 
-from flashlm.compression.semi_structure.semi_pruning_helper import collect_info_reg, help_functions_hn, model_replace, model_replace_with_qk_share, help_functions_share, collect_info_share
-from flashlm.compression.semi_structure.hypernetwork import hypernetwork, simplifed_gate, hard_sample
-
-SENSITIVE_KEYWORDS = ("token", "key", "secret", "password", "passwd")
-PATH_KEYWORDS = ("path", "dir")
-
-def _redact_path(path: str) -> str:
-    if not path:
-        return path
-    name = os.path.basename(os.path.normpath(path))
-    return os.path.join("<PATH>", name) if name else "<PATH>"
-
-def _redact_sensitive_value(value, key: str = ""):
-    key_lower = key.lower()
-    if any(word in key_lower for word in SENSITIVE_KEYWORDS):
-        return "<REDACTED>"
-    if isinstance(value, str):
-        if any(word in key_lower for word in PATH_KEYWORDS) or os.path.isabs(value):
-            return _redact_path(value)
-        value = re.sub(r"\b(?:hf|sk)-[A-Za-z0-9_\-]{8,}\b", "<REDACTED>", value)
-        value = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._\-+/=]{8,}", "Bearer <REDACTED>", value)
-        return value
-    if isinstance(value, (list, tuple)):
-        return type(value)(_redact_sensitive_value(v, key=key) for v in value)
-    if isinstance(value, dict):
-        return {k: _redact_sensitive_value(v, key=str(k)) for k, v in value.items()}
-    return value
+from flashlm.compression.semi_structure.semi_pruning_helper3 import collect_info_reg, help_functions_hn, model_replace, model_replace_with_qk_share, help_functions_share, collect_info_share
+from flashlm.compression.semi_structure.hypernetwork2 import hypernetwork, simplifed_gate, hard_sample
+# TORCH_SHARING_STRATEGY=file_descriptor avoids the torch_shm_manager ("Shared memory manager connection has timed out")
+if os.environ.get("TORCH_SHARING_STRATEGY"):
+    import torch.multiprocessing as _tmp_mp
+    _tmp_mp.set_sharing_strategy(os.environ["TORCH_SHARING_STRATEGY"])
 
 def _find_param_aliases(model):
     seen = {}
@@ -324,6 +303,7 @@ def main(
     resume_dir: str | None = None,
     hidden_kd = False,
     share_qk: bool = False,
+    uniform_sparsity: bool = False,
 ):
     env = DistributedEnv()
     # === Hyperparameters Logging Start ===
@@ -336,7 +316,7 @@ def main(
         
         for k in sorted(params.keys()):
             if k not in exclude and not k.startswith('__'):
-                val = _redact_sensitive_value(params[k], key=k)
+                val = params[k]
                 val_str = str(val)
                 if len(val_str) > 40:
                     val_str = val_str[:37] + "..."
@@ -367,8 +347,7 @@ def main(
     if out_dir is None:
         dateTimeObj = datetime.datetime.now()
         timestamp = dateTimeObj.strftime("%Y-%m-%d_%H-%M-%S")
-        output_root = os.environ.get("GROUPMASK_OUTPUT_ROOT", "outputs")
-        out_dir = os.path.join(output_root, exp_name, timestamp)
+        out_dir = os.path.join(os.environ.get('GROUPMASK_OUTPUT_ROOT', 'outputs'), exp_name, timestamp)
     if rand_seed is None:
         rand_seed = start_iter
         
@@ -417,6 +396,14 @@ def main(
             torch_dtype=torch.bfloat16
         )
     model.config.use_cache = False
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
+        env.print_master("[MEM] Enabled gradient checkpointing.")
     config = model.config
     print(model)
     
@@ -431,6 +418,11 @@ def main(
     # use alpaca for training
     elif dataset_list == ['alpaca']:
         train_dataset = load_hf_dataset_alpaca(split='train', n_shards=env.world_size * num_workers, seed=dataset_seed)
+    # C4-en calibration (one local shard), to match ProxSparse's calibration data
+    elif dataset_list == ['c4']:
+        from datasets import load_dataset as _load_dataset
+        train_dataset = _load_dataset('json', data_files=os.environ.get('C4_JSON', 'c4-train.00000-of-01024.json.gz'),
+                                      split='train').select_columns(['text']).to_iterable_dataset(num_shards=env.world_size * num_workers)
     train_dataloader_hn = dataloader_creator(
         dataset=train_dataset,
         tokenizer=tokenizer,
@@ -469,7 +461,7 @@ def main(
         param_reg = collect_info_share(model, p=p, lam=lam)
         hn_helper = help_functions_share(param_reg.structures, gamma=gamma)
     else:
-        param_reg = collect_info_reg(model, p=p, lam=lam)
+        param_reg = collect_info_reg(model, p=p, lam=lam, uniform=uniform_sparsity)
         hn_helper = help_functions_hn(param_reg.structures, gamma=gamma)
     # param_reg = collect_info_reg(model, p=p, lam=lam)
     # hn_helper = help_functions_hn(param_reg.structures, gamma=gamma)
@@ -533,9 +525,9 @@ def main(
     if resume:
         latest = _find_latest_hn_ckpt(out_dir)
         if latest is None:
-            env.print_master(f"[RESUME] No checkpoint found in {_redact_path(out_dir)}; starting fresh.")
+            env.print_master(f"[RESUME] No checkpoint found in {out_dir}; starting fresh.")
         else:
-            env.print_master(f"[RESUME] Loading HN checkpoint: {_redact_path(latest)}")
+            env.print_master(f"[RESUME] Loading HN checkpoint: {latest}")
             ckpt = torch.load(latest, map_location='cpu')
             # Strip possible Distributed prefixes
             from collections import OrderedDict
@@ -662,14 +654,14 @@ def train_hn(
     if env.world_size == 1:
         if env.global_rank == 0:
             state_dict_hn = hn.state_dict()
-            env.print_master(f"Saving checkpoint to {_redact_path(out_dir)}")
+            env.print_master(f"Saving checkpoint to {out_dir}")
             hn_path = os.path.join(out_dir, f"hn-ckpt.pt")
             torch.save(state_dict_hn, hn_path)
 
     else:
         if hasattr(hn, "module"):
             state_dict_hn = hn.module.state_dict()
-            env.print_master(f"Saving checkpoint to {_redact_path(out_dir)}")
+            env.print_master(f"Saving checkpoint to {out_dir}")
             hn_path = os.path.join(out_dir, f"hn-ckpt.pt")
             torch.save(state_dict_hn, hn_path)
         else:
@@ -685,7 +677,7 @@ def train_hn(
                 # state_dict_hn = hn._orig_mod.state_dict()
                 # state_dict_hn = hn.state_dict()
             if env.global_rank == 0:
-                env.print_master(f"Saving checkpoint to {_redact_path(out_dir)}")
+                env.print_master(f"Saving checkpoint to {out_dir}")
                 hn_path = os.path.join(out_dir, f"hn-ckpt.pt")
                 torch.save(state_dict_hn, hn_path)
                 
@@ -727,7 +719,7 @@ def train_hn(
         #     targets = targets[:,:hn_block_size]
 
         #     if iter_num < 5 and env.global_rank == 0:
-        #         # pad_id = tokenizer.pad_token_id  # 需要你把 tokenizer 传进 train_hn（下面第2点）
+        #         # pad_id = tokenizer.pad_token_id
         #         env.print_master(f"[DBG] pad_id={pad_id} ignored_token={ignored_token}")
         #         env.print_master(f"[DBG] input has pad: {bool((input_ids==pad_id).any().item())} | ratio: {(input_ids==pad_id).float().mean().item():.6f}")
         #         env.print_master(f"[DBG] labels has -100: {bool((targets==-100).any().item())} | ratio: {(targets==-100).float().mean().item():.6f}")
@@ -951,9 +943,9 @@ def train_hn(
                 #                             teacher_logits.view(-1, teacher_logits.size(-1)), 
                 #                             targets.view(-1))
                 
-                # TopK 的 loss
+                # top-k loss
                 # T_kd = 1.0
-                # k_top = 64  # 先用 64；如果还想更强可以试 128
+                # k_top = 64
                 # loss_kd = TopKForwardKDLoss(
                 #     student_logits=logits,
                 #     teacher_logits=teacher_logits,
@@ -1026,7 +1018,7 @@ def train_hn(
             #     print(h.requires_grad, h.grad_fn)
 
             reg_loss = param_reg(hard_vectors) # from vector to hard vector
-            # reg_loss = param_reg(vectors)  # soft 与 forward 同一个mask
+            # reg_loss = param_reg(vectors)  # soft and forward use the same mask
 
             
             # reg_loss = param_reg(vectors)
@@ -1101,14 +1093,14 @@ def train_hn(
             if env.world_size == 1:
                 if env.global_rank == 0:
                     state_dict_hn = hn.state_dict()
-                    env.print_master(f"Saving checkpoint to {_redact_path(out_dir)}")
+                    env.print_master(f"Saving checkpoint to {out_dir}")
                     hn_path = os.path.join(out_dir, f"hn-ckpt-iter-{iter_num:06d}.pt")
                     torch.save(state_dict_hn, hn_path)
 
             else:
                 if hasattr(hn, "module"):
                     state_dict_hn = hn.module.state_dict()
-                    env.print_master(f"Saving checkpoint to {_redact_path(out_dir)}")
+                    env.print_master(f"Saving checkpoint to {out_dir}")
                     hn_path = os.path.join(out_dir, f"hn-ckpt-iter-{iter_num:06d}.pt")
                     torch.save(state_dict_hn, hn_path)
 
@@ -1122,7 +1114,7 @@ def train_hn(
                         # state_dict_hn = hn._orig_mod.state_dict()
                         state_dict_hn = hn.state_dict()
                         if env.global_rank == 0:
-                            env.print_master(f"Saving hn checkpoint to {_redact_path(out_dir)}")
+                            env.print_master(f"Saving hn checkpoint to {out_dir}")
                             hn_path = os.path.join(out_dir, f"hn-ckpt-iter-{iter_num:06d}.pt")
                             torch.save(state_dict_hn, hn_path)
             # torch.cuda.empty_cache()
@@ -1130,13 +1122,13 @@ def train_hn(
     if env.world_size == 1:
         if env.global_rank == 0:
             state_dict_hn = hn.state_dict()
-            env.print_master(f"Saving checkpoint to {_redact_path(out_dir)}")
+            env.print_master(f"Saving checkpoint to {out_dir}")
             hn_path = os.path.join(out_dir, f"hn-ckpt-final.pt")
             torch.save(state_dict_hn, hn_path)
     else:
         if hasattr(hn, "module"):
             state_dict_hn = hn.module.state_dict()
-            env.print_master(f"Saving checkpoint to {_redact_path(out_dir)}")
+            env.print_master(f"Saving checkpoint to {out_dir}")
             hn_path = os.path.join(out_dir, f"hn-ckpt-final.pt")
             torch.save(state_dict_hn, hn_path)
 
@@ -1150,7 +1142,7 @@ def train_hn(
                 # state_dict_hn = hn._orig_mod.state_dict()
                 state_dict_hn = hn.state_dict()
                 if env.global_rank == 0:
-                    env.print_master(f"Saving hn checkpoint to {_redact_path(out_dir)}")
+                    env.print_master(f"Saving hn checkpoint to {out_dir}")
                     hn_path = os.path.join(out_dir, f"hn-ckpt-final.pt")
                     torch.save(state_dict_hn, hn_path)
     

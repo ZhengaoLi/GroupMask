@@ -34,8 +34,8 @@ class FlashLlamaAttention(LlamaAttention):
         position_ids = position_ids.unsqueeze(0).expand(bsz, -1)
         cos, sin = self.rotary_emb(value_states, position_ids=position_ids)
         
-        # kv_seq_len = key_states.shape[-2] # 替换
-        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len) # 替换
+        # kv_seq_len = key_states.shape[-2]
+        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
         # position_ids = torch.arange(0, q_len, dtype=torch.long, device=hidden_states.device)
         # position_ids = position_ids.unsqueeze(0).view(-1, q_len)
